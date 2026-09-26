@@ -1,7 +1,9 @@
 // 协作远征断线恢复编排（规则 2.10.1）：
 //
 // 统一恢复顺序——
-//   ① 跨章切换/全量对齐（getCoopExpedition 权威视口 + 权威游标）；
+//   ① 跨章切换/全量对齐（getCoopExpedition 权威视口 + 游标锚定：本地持久化
+//      游标仍指向同一章节 run 时保留本地位置，离线窗口的队友动作由增量
+//      同步补播；跨章/失效才以权威游标整体替换）；
 //      其他章节 run 的未确认意图一律隔离丢弃，绝不补交进新章
 //      （旧意图的扣款/发奖属于旧章，重放=重复扣款/发奖/播放）；
 //   ② 同章节未确认意图逐条核对服务端结果（probe）：
@@ -15,7 +17,7 @@
 // 旧章节响应隔离：所有异步响应（/act、sync）在应用前都要核对其 run_id 仍
 // 是当前章节 run；章节已切换就丢弃响应（其游标也不得回拉）。
 import { api, ConflictError, ForbiddenError, NetworkError,
-         makeRequestId, setCoopCursor } from './api'
+         makeRequestId, anchorCoopCursor } from './api'
 import { useStore } from './store'
 import { playBattleLog, waitForBattleBus } from './phaser/battleBus'
 import { recordPending, clearPending, listPending,
@@ -167,7 +169,10 @@ async function _recoverCoopInner(teamId, { runView, cursor }, summary) {
     // 主动对齐：允许 run 切换（旧章 -> 新章是唯一合法的非守卫切换）
     useStore.getState().applyRun(entry.run)
   }
-  if (entry.cursor) setCoopCursor(entry.cursor)
+  // 游标锚定（2.10.2）：会话内/本地持久化游标仍有效时保留本地位置——离线
+  // 窗口的队友动作由随后的增量同步补播，不漏不重；跨章/失效才以权威游标
+  // 整体替换（reset 路径在调用前已权威锚定，这里幂等为空操作）。
+  if (entry.cursor) anchorCoopCursor(teamId, entry.cursor)
 
   const currentRunId = entry.run?.run_id || useStore.getState().runId
   if (!currentRunId) return summary

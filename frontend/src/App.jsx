@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { api, setCoopCursor } from './api'
+import { api, anchorCoopCursor } from './api'
 import { useStore } from './store'
 import { useCoopSync } from './coopSync.js'
 import { recoverCoop, recoverSoloRun, submitRunAction } from './coopRecovery'
@@ -151,7 +151,9 @@ export default function App() {
       void recoverCoop(team.id, { runView }).catch(() => {})
       return
     }
-    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口，并以权威游标启动增量同步
+    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口；游标走锚定恢复——
+    // 本地持久化游标仍有效（同章/未超前/未落后过多）时保留本地位置，
+    // 离线窗口的队友动作由增量同步补播；否则以权威游标锚定
     setLoading(true); setErr('')
     api.getCoopExpedition(team.id)
       .then((data) => {
@@ -159,7 +161,7 @@ export default function App() {
           applyRun(data.run)
           setRunId(data.run.run_id)
         }
-        if (data.cursor) setCoopCursor(data.cursor)
+        if (data.cursor) anchorCoopCursor(team.id, data.cursor)
         // 断线恢复：权威视口/游标已在手，直接核对同章节未确认意图
         if (data.run) {
           void recoverCoop(team.id, { runView: data.run, cursor: data.cursor })

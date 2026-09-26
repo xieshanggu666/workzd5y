@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { loadCoopFeed, saveCoopFeed, isFeedKeyKnown } from './coopPersist'
 
 const initialState = {
   cards: [],            // 全部卡牌元数据
@@ -69,17 +70,42 @@ export const useStore = create((set, get) => ({
   setCoopReconnectNow: (fn) => set({ coopReconnectNow: fn }),
 
   // 追加队伍动态（最新在前），保留最近 FEED_LIMIT 条；key 在此统一自增分配，
-  // 避免跨章节 run 的日志 seq 复用导致 React key 冲突
+  // 避免跨章节 run 的日志 seq 复用导致 React key 冲突。
+  // 重复帧隔离（2.10.2）：带 dk（去重键）的事件只入栏一次——本地窗口 +
+  // 持久化记忆窗口双重判定，刷新后游标回退重发也不重复入栏；非空变更按
+  // 队伍落 localStorage，刷新后由 hydrateCoopFeed 恢复。
   pushCoopFeed: (items) => set((s) => {
-    const base = s._feedSeq || 0
-    const tagged = (items || []).map((it, i) => ({ ...it, key: `f${base + i}` }))
-    return {
-      coopFeed: [...tagged, ...s.coopFeed].slice(0, FEED_LIMIT),
-      _feedSeq: base + tagged.length,
+    const teamId = s.view?.coop?.team_id || null
+    const known = new Set(s.coopFeed.map((f) => f.dk).filter(Boolean))
+    const fresh = []
+    for (const it of items || []) {
+      if (it.dk) {
+        if (known.has(it.dk)) continue
+        if (teamId && isFeedKeyKnown(teamId, it.dk)) continue
+        known.add(it.dk)
+      }
+      fresh.push(it)
     }
+    if (!fresh.length) return {}
+    const base = s._feedSeq || 0
+    const tagged = fresh.map((it, i) => ({ ...it, key: `f${base + i}` }))
+    const coopFeed = [...tagged, ...s.coopFeed].slice(0, FEED_LIMIT)
+    if (teamId) saveCoopFeed(teamId, coopFeed)
+    return { coopFeed, _feedSeq: base + tagged.length }
   }),
 
-  clearCoopFeed: () => set({ coopFeed: [], _feedSeq: 0 }),
+  // 进入协作队时恢复本地持久化的最近动态（刷新不丢；key 重新分配）
+  hydrateCoopFeed: (teamId) => {
+    if (!teamId) return
+    const tagged = loadCoopFeed(teamId).map((it, i) => ({ ...it, key: `f${i}` }))
+    set({ coopFeed: tagged, _feedSeq: tagged.length })
+  },
+
+  clearCoopFeed: () => {
+    const teamId = get().view?.coop?.team_id
+    if (teamId) saveCoopFeed(teamId, [])
+    set({ coopFeed: [], _feedSeq: 0 })
+  },
 
   cardMeta: (id) => get().cards.find((c) => c.id === id) || null,
 }))

@@ -1,3 +1,6 @@
+import { loadCoopCursorState, saveCoopCursorAnchor, saveCoopCursorAdvance,
+         SEEN_LIMIT } from './coopPersist'
+
 const BASE = '/api'
 
 // 行动请求并发控制：
@@ -12,16 +15,24 @@ let currentMemberId = null
 
 // 协作增量同步（2.10.0）：客户端游标，锚定三条日志的已读位置
 // （章节 run 动作日志 run_seq / 队伍时间线 team_seq / 远征事件 exp_seq）。
-// 由全量入口（getCoopExpedition）初始化、sync 响应持续推进；页面刷新后丢失，
-// 首次同步走 reset 全量对齐——与断线重连同一条路径。
+// 由全量入口（getCoopExpedition）锚定、sync 响应持续推进；2.10.2 起按队伍
+// 持久化到 localStorage（coopPersist），刷新/断线后恢复本地游标继续增量
+// 跟随——离线窗口的队友动作照常补播，不再一律 reset 全量对齐。
 let coopCursor = null
+let coopCursorTeam = null  // 当前游标归属的队伍（持久化键）
 
 export function getCoopCursor() {
   return coopCursor
 }
 
-export function setCoopCursor(cursor) {
+// 权威游标整体锚定（全量入口 / sync reset 回包）：游标之前的动作视为已随
+// 全量视口应用（seen 地板抬到 run_seq）；跨章切换时旧章游标/帧记录一并淘汰。
+export function setCoopCursor(cursor, teamId = null) {
+  if (teamId) coopCursorTeam = teamId
   coopCursor = cursor ? { ...cursor } : null
+  if (coopCursorTeam && coopCursor?.run_id) {
+    saveCoopCursorAnchor(coopCursorTeam, coopCursor)
+  }
 }
 
 // 游标单调推进（断线恢复 2.10.1）：迟到的旧响应（章节切换前发出的 sync）
@@ -30,20 +41,59 @@ export function setCoopCursor(cursor) {
 // 注意：本地自己的动作【不】推进游标——自己的动作会随下一次增量回到客户端，
 // 由同步器按 actor 过滤（自己的动作不补播、不进队伍动态）；若用本地 seq 推进
 // 游标，会把「自己动作之前、尚未看到的队友动作」一并跳过（补播永久缺失）。
-export function advanceCoopCursor(next) {
+export function advanceCoopCursor(next, teamId = null) {
   if (!next || !next.run_id) return
+  if (teamId) coopCursorTeam = teamId
   if (!coopCursor || coopCursor.run_id !== next.run_id) {
     coopCursor = { ...next }
-    return
+  } else {
+    const max = (a, b) => (Number.isInteger(a) && Number.isInteger(b) ? Math.max(a, b) : (b ?? a))
+    coopCursor = {
+      ...next,
+      run_seq: max(coopCursor.run_seq, next.run_seq),
+      team_seq: max(coopCursor.team_seq, next.team_seq),
+      exp_seq: max(coopCursor.exp_seq, next.exp_seq),
+      rev: max(coopCursor.rev, next.rev),
+    }
   }
-  const max = (a, b) => (Number.isInteger(a) && Number.isInteger(b) ? Math.max(a, b) : (b ?? a))
-  coopCursor = {
-    ...next,
-    run_seq: max(coopCursor.run_seq, next.run_seq),
-    team_seq: max(coopCursor.team_seq, next.team_seq),
-    exp_seq: max(coopCursor.exp_seq, next.exp_seq),
-    rev: max(coopCursor.rev, next.rev),
+  // 增量推进随落盘（seen 帧记录保留）：刷新后按已应用前沿回退恢复
+  if (coopCursorTeam) saveCoopCursorAdvance(coopCursorTeam, coopCursor)
+}
+
+// 本地游标是否可继续增量跟随：同章、未超前、未落后超过服务端增量上限
+// （落后更多服务端本就 reset，直接以权威锚定省一轮往返）。
+function usableCoopCursor(candidate, authoritative) {
+  if (!candidate || candidate.run_id !== authoritative.run_id) return false
+  const le = (a, b) => !Number.isInteger(a) || !Number.isInteger(b) || a <= b
+  if (!le(candidate.run_seq, authoritative.run_seq)) return false
+  if (!le(candidate.team_seq, authoritative.team_seq)) return false
+  if (!le(candidate.exp_seq, authoritative.exp_seq)) return false
+  if (Number.isInteger(candidate.run_seq) && Number.isInteger(authoritative.run_seq)
+      && authoritative.run_seq - candidate.run_seq > SEEN_LIMIT) return false
+  return true
+}
+
+// 全量对齐时的游标锚定（2.10.2：进入协作远征 / 断线重连恢复）。
+// 会话内游标或本地持久化游标仍指向同一章节 run 且可继续增量时，保留本地
+// 位置（持久化游标已按已应用前沿回退）——离线窗口的队友动作由随后的增量
+// 同步逐帧补播，已播的凭已应用帧记录隔离，不漏不重；否则（首次进入/跨章/
+// 游标失效）以权威游标整体锚定。返回最终生效的游标。
+export function anchorCoopCursor(teamId, authoritative) {
+  if (teamId) coopCursorTeam = teamId
+  if (!teamId || !authoritative || !authoritative.run_id) {
+    setCoopCursor(authoritative, teamId)
+    return coopCursor
   }
+  if (usableCoopCursor(coopCursor, authoritative)) {
+    return coopCursor  // 会话内游标仍然有效（断线重连最常见路径）
+  }
+  const persisted = loadCoopCursorState(teamId)?.cursor || null
+  if (usableCoopCursor(persisted, authoritative)) {
+    coopCursor = persisted  // 刷新后恢复本地游标；不覆盖持久化的完整游标
+    return coopCursor
+  }
+  setCoopCursor(authoritative, teamId)
+  return coopCursor
 }
 
 export function setExpectedRev(rev) {
