@@ -90,7 +90,7 @@ export default function CoopPanel() {
       {coopFeed.length > 0 && (
         <ul className="coop-feed">
           {coopFeed.slice(0, 6).map((f) => (
-            <li key={f.key}>{f.text}</li>
+            <li key={f.id}>{f.text}</li>
           ))}
         </ul>
       )}

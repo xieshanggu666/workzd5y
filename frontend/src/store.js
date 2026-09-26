@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { addCoopFeed } from './coopPersist'
 
 const initialState = {
   cards: [],            // 全部卡牌元数据
@@ -20,10 +21,16 @@ const initialState = {
   coopFeed: [],
   coopSyncNow: null,
   coopReconnectNow: null,
-  _feedSeq: 0,          // 队伍动态 key 自增器（pushCoopFeed 内部使用）
 }
 
 const FEED_LIMIT = 12
+
+// 无稳定 id 的动态（防御性兜底；正常路径均由 coopPersist 分配稳定 id）
+let feedFallbackSeq = 0
+function localFeedKey(it) {
+  feedFallbackSeq += 1
+  return `mem:${feedFallbackSeq}:${it.text}`
+}
 
 export const useStore = create((set, get) => ({
   ...initialState,
@@ -68,18 +75,44 @@ export const useStore = create((set, get) => ({
 
   setCoopReconnectNow: (fn) => set({ coopReconnectNow: fn }),
 
-  // 追加队伍动态（最新在前），保留最近 FEED_LIMIT 条；key 在此统一自增分配，
-  // 避免跨章节 run 的日志 seq 复用导致 React key 冲突
-  pushCoopFeed: (items) => set((s) => {
-    const base = s._feedSeq || 0
-    const tagged = (items || []).map((it, i) => ({ ...it, key: `f${base + i}` }))
-    return {
-      coopFeed: [...tagged, ...s.coopFeed].slice(0, FEED_LIMIT),
-      _feedSeq: base + tagged.length,
+  // 追加队伍动态（最新在前），保留最近 FEED_LIMIT 条。
+  // 2.10.2：每条带稳定 id（由 coopPersist.buildFeedItems / localFeedId 分配），
+  // 按 id 去重——轮询、reset、重连补捞可能把同一条服务端事件重复带回，只上屏
+  // 一次；带 teamId 的动态同步落 localStorage（刷新/断线重连后水合恢复）。
+  pushCoopFeed: (items) => {
+    const s = get()
+    const present = new Set(s.coopFeed.map((it) => it.id).filter(Boolean))
+    const fresh = []
+    for (const it of items || []) {
+      if (!it || !it.text) continue
+      const id = it.id || localFeedKey(it)
+      if (present.has(id)) continue
+      present.add(id)
+      fresh.push({ ...it, id })
     }
-  }),
+    if (!fresh.length) return
+    // 落盘（addCoopFeed 内部再按 id/TTL 去重一次，覆盖多标签页等竞态）
+    const withTeam = fresh.filter((it) => it.teamId)
+    if (withTeam.length) addCoopFeed(withTeam[0].teamId, withTeam)
+    set({ coopFeed: [...fresh, ...s.coopFeed].slice(0, FEED_LIMIT) })
+  },
 
-  clearCoopFeed: () => set({ coopFeed: [], _feedSeq: 0 }),
+  // 重连/进入协作远征时水合本地持久化的队伍动态（刷新后不丢）；同样按 id 去重。
+  hydrateCoopFeed: (items) => {
+    const s = get()
+    const present = new Set(s.coopFeed.map((it) => it.id).filter(Boolean))
+    const merged = []
+    for (const it of items || []) {
+      if (!it || !it.id || !it.text || present.has(it.id)) continue
+      present.add(it.id)
+      merged.push({ ...it })
+    }
+    if (!merged.length) return
+    // 持久化项按 ts 已为新->旧；现有内存项（多为本地提示）置于其后
+    set({ coopFeed: [...merged, ...s.coopFeed].slice(0, FEED_LIMIT) })
+  },
+
+  clearCoopFeed: () => set({ coopFeed: [] }),
 
   cardMeta: (id) => get().cards.find((c) => c.id === id) || null,
 }))

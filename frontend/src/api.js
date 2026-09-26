@@ -10,10 +10,11 @@ let expectedRev = null
 // 的每个动作都带 member_id，服务端据此做角色权限边界（越权 403、零副作用）。
 let currentMemberId = null
 
-// 协作增量同步（2.10.0）：客户端游标，锚定三条日志的已读位置
+// 协作增量同步（2.10.0/2.10.2）：客户端游标，锚定三条日志的已读位置
 // （章节 run 动作日志 run_seq / 队伍时间线 team_seq / 远征事件 exp_seq）。
-// 由全量入口（getCoopExpedition）初始化、sync 响应持续推进；页面刷新后丢失，
-// 首次同步走 reset 全量对齐——与断线重连同一条路径。
+// 由全量入口（getCoopExpedition）初始化、sync 响应持续推进；游标本体的
+// localStorage 持久化由 coopPersist 在恢复/同步编排层负责（按队伍分片、
+// TTL 淘汰），这里只维护本次会话的活动游标。
 let coopCursor = null
 
 export function getCoopCursor() {

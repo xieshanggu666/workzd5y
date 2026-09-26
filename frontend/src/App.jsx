@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { api, setCoopCursor } from './api'
+import { api } from './api'
 import { useStore } from './store'
 import { useCoopSync } from './coopSync.js'
 import { recoverCoop, recoverSoloRun, submitRunAction } from './coopRecovery'
@@ -127,13 +127,16 @@ export default function App() {
     setLoading(true); setErr('')
     try {
       // 协作远征走队伍推进接口（服务端校验仅队长可操作）；单人远征走原接口
-      const coopTeamId = view?.coop?.team_id
-      if (coopTeamId) setCoopTeamId(coopTeamId)
-      const data = coopTeamId
-        ? await api.advanceCoopExpedition(coopTeamId)
+      const teamId = view?.coop?.team_id
+      if (teamId) setCoopTeamId(teamId)
+      const data = teamId
+        ? await api.advanceCoopExpedition(teamId)
         : await api.advanceExpedition(expeditionId)
       applyRun(data.run)
       setRunId(data.run.run_id)
+      // 推进响应不含游标：立即走统一恢复（持久化旧游标补捞 advance 时间线，
+      // 再锚定新章权威游标），不必等下一轮轮询触发 reset
+      if (teamId) void recoverCoop(teamId, { runView: data.run }).catch(() => {})
     } catch (e) {
       setErr(e.message)
     } finally {
@@ -145,23 +148,20 @@ export default function App() {
     setShowCoop(false)
     setCoopTeamId(team.id)
     if (runView) {
-      applyRun(runView)
+      // 统一恢复编排负责视口对齐（允许跨章切换）：先水合动态/补捞缺口再对齐，
+      // 避免队友历史帧在旧画面上闪动；runId 先就位供恢复期间的守卫判断
       setRunId(runView.run_id)
-      // 断线恢复（开赛后进入）：统一顺序——全量对齐 -> 隔离旧章 -> 核对补交
       void recoverCoop(team.id, { runView }).catch(() => {})
       return
     }
-    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口，并以权威游标启动增量同步
+    // 大厅“进入协作远征”：拉取队伍当前章节 run 视口；视口对齐、游标恢复
+    // （水合动态 -> 持久化游标补捞缺口 -> 权威游标锚定）与未确认意图核对
+    // 都由 recoverCoop 统一编排，避免两条路径各自对齐造成交错
     setLoading(true); setErr('')
     api.getCoopExpedition(team.id)
       .then((data) => {
         if (data.run) {
-          applyRun(data.run)
           setRunId(data.run.run_id)
-        }
-        if (data.cursor) setCoopCursor(data.cursor)
-        // 断线恢复：权威视口/游标已在手，直接核对同章节未确认意图
-        if (data.run) {
           void recoverCoop(team.id, { runView: data.run, cursor: data.cursor })
             .catch(() => {})
         }

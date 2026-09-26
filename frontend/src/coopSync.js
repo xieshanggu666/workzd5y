@@ -16,44 +16,10 @@ import { api, getCoopCursor, getCurrentMemberId, setCoopCursor,
 import { useStore } from './store'
 import { playBattleLog } from './phaser/battleBus'
 import { recoverCoop, isActing } from './coopRecovery'
+import { buildFeedItems, saveCoopCursor } from './coopPersist'
 
 const POLL_MS = 2500
 const RECONNECT_DEBOUNCE_MS = 1200
-
-// 动作 -> 队伍动态文案（侧栏「最近动态」）
-const ACTION_TEXT = {
-  create: '创建章节',
-  choose_node: '选择了路线',
-  play: '打出卡牌',
-  end_turn: '结束回合',
-  use_potion: '使用药水',
-  claim_reward: '领取奖励',
-  forge: '锻造卡牌',
-  shop_buy: '完成购买',
-  shop_remove: '移除卡牌',
-  discard_potion: '丢弃药水',
-  companion_set_mode: '调整伙伴',
-  commission_accept: '接取委托',
-  commission_claim: '领取委托奖励',
-  encounter_choice: '奇遇抉择',
-}
-
-const TEAM_EVENT_TEXT = {
-  form: '队伍组建',
-  join: '新成员加入',
-  role: '角色调整',
-  leave: '成员离队',
-  disband: '队伍解散',
-  start: '远征开赛',
-  chapter_clear: '章节通关',
-  advance: '进入下一章',
-  settle: '远征结算',
-}
-
-function memberName(view, id) {
-  const m = (view?.coop?.members || []).find((x) => x.id === id)
-  return m ? `${m.icon || ''}${m.name}` : null
-}
 
 export function useCoopSync() {
   const teamId = useStore((s) => s.view?.coop?.team_id || null)
@@ -106,6 +72,9 @@ export function useCoopSync() {
 
       // 通过隔离检查后才推进游标（同 run 单调前进；跨章由章节切换路径替换）
       advanceCoopCursor(data.cursor)
+      // 游标持久化（2.10.2）：刷新/断线/跨章后由 recoverCoop 取回恢复；
+      // reset 分支随后会再以权威游标覆盖一次。
+      saveCoopCursor(tid, data.cursor)
       // 权威版本锚点随响应对齐（视口 rev 优先，心跳时取游标 rev——旧档迁移
       // 不产生动作事件但会推进 rev），避免后续动作带过期 expected_rev 必遭 409
       const authRev = data.run?.rev ?? data.cursor?.rev
@@ -116,20 +85,10 @@ export function useCoopSync() {
       // 自己的动作已随本地 /act 响应播放/应用：增量里再遇到（actor===我）
       // 既不补播也不进队伍动态，只随游标推进跳过——队友动作不受影响。
       const newActions = (data.actions || []).filter((a) => a.actor !== myId)
-      // 队伍动态：动作增量（标注操作者）+ 队伍时间线增量（key 由 store 统一分配）
-      const feed = []
-      for (const a of newActions) {
-        if (a.action === 'create') continue
-        const who = memberName(view, a.actor)
-        feed.push({ text: `${who || '队友'} ${ACTION_TEXT[a.action] || a.action}` })
-      }
-      for (const e of data.team_events || []) {
-        feed.push({ text: `👥 ${TEAM_EVENT_TEXT[e.kind] || e.kind}` })
-      }
-      for (const e of data.expedition_events || []) {
-        if (e.kind === 'create') continue
-        feed.push({ text: `🚩 ${TEAM_EVENT_TEXT[e.kind] || e.kind}` })
-      }
+      // 队伍动态：动作增量（标注操作者）+ 队伍/远征时间线增量。文案与稳定 id
+      // 由 coopPersist 统一构造——与重连补捞同一条路径，同一事件重复带回不重屏
+      const feed = buildFeedItems(tid, { ...data, actions: newActions },
+                                  { myId, view })
       if (feed.length) useStore.getState().pushCoopFeed(feed.reverse())
 
       if (data.reset) {
@@ -139,21 +98,27 @@ export function useCoopSync() {
         // 能走到这里说明该 reset 包已通过旧章隔离（serverRun===currentRun，
         // 或本地尚无 run）；直接应用并以权威游标锚定。
         if (data.run) applyRun(data.run)
-        if (data.cursor) setCoopCursor(data.cursor)
-        // 恢复在后台串行（补播/补交期间 acting/syncing 锁定操作）
+        if (data.cursor) {
+          setCoopCursor(data.cursor)
+          saveCoopCursor(tid, data.cursor)
+        }
+        // 恢复在后台串行（补播/补交期间 acting/syncing 锁定操作）；显式权威
+        // 游标已在手上，恢复流程不再用旧游标补捞，避免与上面的动态重复
         void recoverCoop(tid, { runView: data.run, cursor: data.cursor })
           .catch(() => {})
         return
       }
 
-      const oldSeq = cursorAtCall?.run_id === serverRun
-        ? (cursorAtCall?.run_seq ?? 0)
+      // 重复帧隔离：以「推进游标后的已确认水位」为准（而非请求发出时的旧游标），
+      // 只播严格新于该水位的动作——重连恢复可能已先把游标锚到更后位置，迟到的
+      // 轮询包绝不能把同一帧再补播一遍；自己的动作已按 actor 过滤。
+      const liveCursor = getCoopCursor()
+      const watermark = liveCursor?.run_id === serverRun
+        ? (liveCursor?.run_seq ?? 0)
         : 0
       const actions = newActions
         .filter((a) => !a.replay_only)
-        // 只播严格新于本地已确认位置的动作（迟到旧包不重播；自己的动作已在上
-        // 面按 actor 过滤）
-        .filter((a) => Number.isInteger(a.seq) && a.seq > oldSeq)
+        .filter((a) => Number.isInteger(a.seq) && a.seq > watermark)
       if (!actions.length) return
 
       // 局部重放：战斗中逐帧补播结算动画（与本地操作同一套 Phaser 播放）；
